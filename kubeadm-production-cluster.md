@@ -17,9 +17,10 @@ Step-by-step guide to bootstrap a production-ready Kubernetes cluster using **ku
 
 | Role           | Count | Notes                                      |
 |----------------|-------|--------------------------------------------|
-| Control plane  | 3     | Odd number for etcd quorum                 |
+| Control plane  | 3     | Odd number for etcd quorum (if stacked)    |
 | Workers        | 2+    | Scale to workload needs                    |
 | Load balancer  | 1     | VIP / HAProxy / cloud LB for API server    |
+| etcd (optional external) | 3 | Prefer dedicated nodes; see [external-etcd-tarball-systemd.md](./external-etcd-tarball-systemd.md) |
 
 ### Decisions before you start
 
@@ -433,9 +434,12 @@ At this point the node is `NotReady` until a CNI is installed.
 
 ## 6. Install a CNI plugin
 
-Pick one. Example: **Flannel** (simple) or **Calico/Cilium** (production features).
+Pick **one** CNI. Full guides:
 
-### Option A — Flannel
+- [Calico](./cni-calico.md) — Tigera Operator, BGP / IPIP / VXLAN, NetworkPolicy
+- [Cilium](./cni-cilium.md) — eBPF, optional kube-proxy replacement, Hubble
+
+### Option A — Flannel (minimal)
 
 ```bash
 kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
@@ -445,12 +449,18 @@ Ensure `podSubnet` matches Flannel’s network (default `10.244.0.0/16`).
 
 ### Option B — Calico
 
+See [cni-calico.md](./cni-calico.md). Short path:
+
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
-# Then apply a custom resources manifest with your pod CIDR
+export CALICO_VERSION=v3.29.1
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml
+# Edit custom-resources so ipPools.cidr matches networking.podSubnet, then:
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml
 ```
 
 ### Option C — Cilium
+
+See [cni-cilium.md](./cni-cilium.md). Short path:
 
 ```bash
 # Install Cilium CLI, then:
@@ -555,9 +565,298 @@ Store snapshots off-box and test restore periodically.
 
 ---
 
-## 10. Hardening for production
+## 10. Admin shell & utility practices
 
-### 10.1 Access control
+Do this on **admin workstations / bastion hosts** (not required on every worker). Goal: safer, faster day-2 ops once the cluster is up.
+
+### 10.1 Packages worth having
+
+```bash
+sudo apt-get update
+sudo apt-get install -y bash-completion curl jq fzf tmux tree unzip
+
+# Optional but high value:
+# - yq          → YAML queries (snap/binary)
+# - helm        → charts
+# - k9s         → terminal UI
+# - stern       → multi-pod logs (also via krew)
+```
+
+### 10.2 kubectl / kubeadm / helm bash completion
+
+```bash
+# Ensure programmable completion is loaded (Ubuntu usually has this)
+grep -q bash_completion ~/.bashrc || \
+  echo 'source /usr/share/bash-completion/bash_completion' >> ~/.bashrc
+
+# kubectl
+kubectl completion bash | sudo tee /etc/bash_completion.d/kubectl >/dev/null
+
+# Short alias + completion for the alias
+grep -q "alias k=" ~/.bashrc || cat >> ~/.bashrc <<'EOF'
+alias k=kubectl
+complete -o default -F __start_kubectl k
+EOF
+
+# kubeadm (on nodes where kubeadm is installed)
+kubeadm completion bash | sudo tee /etc/bash_completion.d/kubeadm >/dev/null
+
+# helm (if installed)
+# helm completion bash | sudo tee /etc/bash_completion.d/helm >/dev/null
+
+# crictl (node debugging)
+# crictl completion bash | sudo tee /etc/bash_completion.d/crictl >/dev/null
+
+source ~/.bashrc
+```
+
+For **zsh**:
+
+```bash
+# kubectl
+kubectl completion zsh > "${fpath[1]}/_kubectl"
+# or: source <(kubectl completion zsh)
+echo 'alias k=kubectl' >> ~/.zshrc
+echo 'compdef __start_kubectl k' >> ~/.zshrc
+```
+
+### 10.3 Useful aliases
+
+```bash
+cat >> ~/.bashrc <<'EOF'
+# kubectl shortcuts
+alias k='kubectl'
+alias kx='kubectl exec -it'
+alias kl='kubectl logs -f'
+alias kgp='kubectl get pods -o wide'
+alias kgpa='kubectl get pods -A -o wide'
+alias kgn='kubectl get nodes -o wide'
+alias kgs='kubectl get svc -A'
+alias kgd='kubectl get deploy -A'
+alias kdesc='kubectl describe'
+alias kctx='kubectl config get-contexts'
+alias kns='kubectl config view --minify -o jsonpath={..namespace}'
+
+# Safer apply habit: dry-run first when unsure
+alias kapplydry='kubectl apply --dry-run=client -o yaml'
+
+# Prefer server-side apply for owned manifests (optional)
+# alias kapply='kubectl apply --server-side -f'
+EOF
+source ~/.bashrc
+```
+
+Set a default editor for `kubectl edit`:
+
+```bash
+echo 'export EDITOR=vim' >> ~/.bashrc   # or nano / nvim
+```
+
+### 10.4 PS1: show cluster context + namespace
+
+Install [kube-ps1](https://github.com/jonmosco/kube-ps1) so the prompt shows context/namespace (reduces wrong-cluster mistakes).
+
+```bash
+git clone --depth 1 https://github.com/jonmosco/kube-ps1.git ~/.kube-ps1
+
+cat >> ~/.bashrc <<'EOF'
+source ~/.kube-ps1/kube-ps1.sh
+# Compact prompt: user@host  (ctx:ns)  path
+PS1='\[\e[32m\]\u@\h\[\e[0m\] $(kube_ps1) \[\e[34m\]\w\[\e[0m\]\$ '
+KUBE_PS1_SYMBOL_ENABLE=false
+KUBE_PS1_NS_ENABLE=true
+EOF
+source ~/.bashrc
+```
+
+Toggle helpers:
+
+```bash
+# Temporarily hide / show kube info in prompt
+kubeoff
+kubeon
+```
+
+**Alternative:** starship with a Kubernetes module, or Oh My Zsh `kubectl` plugin — same idea (always visible context).
+
+### 10.5 Krew + useful kubectl plugins
+
+[Krew](https://krew.sigs.k8s.io/) is the plugin manager for kubectl.
+
+```bash
+(
+  set -euo pipefail
+  cd "$(mktemp -d)"
+  OS="$(uname | tr '[:upper:]' '[:lower:]')"
+  ARCH="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')"
+  KREW="krew-${OS}_${ARCH}"
+  curl -fsSLO "https://github.com/kubernetes-sigs/krew/releases/latest/download/${KREW}.tar.gz"
+  tar zxvf "${KREW}.tar.gz"
+  ./"${KREW}" install krew
+)
+
+echo 'export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+kubectl krew version
+```
+
+High-value plugins:
+
+```bash
+kubectl krew update
+kubectl krew install \
+  ctx \
+  ns \
+  neat \
+  tree \
+  stern \
+  resource-capacity \
+  view-secret \
+  outdated \
+  node-shell \
+  sniff \
+  access-matrix \
+  score
+```
+
+| Plugin | Use |
+|--------|-----|
+| `ctx` | Switch kubeconfig context quickly (`kubectl ctx`) |
+| `ns` | Switch default namespace (`kubectl ns`) |
+| `neat` | Strip noisy fields from `kubectl get -o yaml` |
+| `tree` | Ownership tree (Deploy → RS → Pod) |
+| `stern` | Tail logs across many pods |
+| `resource-capacity` | CPU/mem requests vs capacity overview |
+| `view-secret` | Decode Secret data safely in terminal |
+| `outdated` | Find images with newer tags |
+| `node-shell` | Debug shell on a node via privileged pod |
+| `sniff` | Packet capture on a pod (tcpdump/wireshark workflow) |
+| `access-matrix` | Who can do what (RBAC overview) |
+| `score` | Static analysis of manifests / live objects |
+
+Everyday patterns:
+
+```bash
+kubectl ctx                         # pick cluster
+kubectl ns prod                     # pick namespace
+kubectl get deploy web -o yaml | kubectl neat
+kubectl tree deploy web
+kubectl stern web -n prod --since=10m
+kubectl resource-capacity --pods --util
+kubectl view-secret my-secret -a
+```
+
+Keep plugins current:
+
+```bash
+kubectl krew upgrade
+kubectl krew list
+```
+
+> Prefer `ctx` / `ns` (or standalone `kubectx` / `kubens`) over memorizing long `kubectl config` commands. Always glance at the PS1 context before destructive applies.
+
+### 10.6 kubeconfig hygiene
+
+```bash
+# Default location
+export KUBECONFIG=$HOME/.kube/config
+
+# Merge multiple clusters without overwriting
+KUBECONFIG=~/.kube/config:~/.kube/cluster-b.conf kubectl config view --flatten > ~/.kube/merged.conf
+mv ~/.kube/merged.conf ~/.kube/config
+chmod 600 ~/.kube/config
+
+# Never commit kubeconfigs; use short-lived tokens / OIDC where possible
+# Separate personal admin creds from break-glass cluster-admin
+```
+
+Useful built-ins:
+
+```bash
+kubectl config get-contexts
+kubectl config current-context
+kubectl config set-context --current --namespace=prod
+kubectl api-resources | less
+kubectl explain pod.spec.containers --recursive | less
+```
+
+### 10.7 Optional terminal tools
+
+| Tool | Why |
+|------|-----|
+| [k9s](https://k9scli.io/) | Fast TUI for pods/logs/resources |
+| [kubectx / kubens](https://github.com/ahmetb/kubectx) | Standalone alternative to krew `ctx`/`ns` |
+| [helm](https://helm.sh/) + completion | Package installs (ingress, metrics extras, etc.) |
+| [stern](https://github.com/stern/stern) | Multi-pod logs (CLI or krew) |
+| [dive](https://github.com/wagoodman/dive) | Inspect image layers before deploy |
+| [kubent](https://github.com/doitintl/kube-no-trouble) | Deprecated API detection before upgrades |
+| `jq` / `yq` | Scriptable JSON/YAML |
+| `fzf` | Fuzzy history / resource picking in custom scripts |
+
+Example: install k9s (pick current release asset for your arch):
+
+```bash
+# See https://github.com/derailed/k9s/releases
+# sudo install -m 0755 k9s /usr/local/bin/k9s
+```
+
+Helm quick setup:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm completion bash | sudo tee /etc/bash_completion.d/helm >/dev/null
+helm repo add stable https://charts.helm.sh/stable 2>/dev/null || true
+helm repo update
+```
+
+### 10.8 Safer kubectl habits
+
+```bash
+# Confirm context before prod changes
+kubectl config current-context
+kubectl cluster-info
+
+# Client-side dry-run
+kubectl apply -f app.yaml --dry-run=client -o yaml
+
+# Server-side dry-run (admission-aware)
+kubectl apply -f app.yaml --dry-run=server
+
+# Diff against live objects
+kubectl diff -f app.yaml
+
+# Wait instead of blind sleep
+kubectl rollout status deploy/web -n prod --timeout=120s
+
+# Events when something is stuck
+kubectl get events -n prod --sort-by='.lastTimestamp' | tail -n 30
+```
+
+Drain pattern for node work:
+
+```bash
+kubectl cordon <node>
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+# ... maintenance ...
+kubectl uncordon <node>
+```
+
+### 10.9 tmux / session tips (bastion)
+
+```bash
+# ~/.tmux.conf (minimal)
+set -g mouse on
+set -g history-limit 50000
+setw -g mode-keys vi
+```
+
+Keep long upgrades / `journalctl -f` / `stern` in dedicated panes; name sessions per cluster (`tmux new -s prod-k8s`).
+
+---
+
+## 11. Hardening for production
+
+### 11.1 Access control
 
 ```bash
 # Prefer OIDC / cloud IAM / LDAP via API server flags or an auth proxy
@@ -566,7 +865,7 @@ kubectl create namespace prod
 # Avoid sharing admin.conf; issue short-lived kubeconfigs or use OIDC
 ```
 
-### 10.2 Network policies
+### 11.2 Network policies
 
 Install a CNI that supports NetworkPolicy (Calico/Cilium), then default-deny in sensitive namespaces:
 
@@ -582,33 +881,33 @@ spec:
     - Ingress
 ```
 
-### 10.3 Admission & policy
+### 11.3 Admission & policy
 
 - Enable / configure Pod Security Admission (`restricted` for prod namespaces)
 - Consider Gatekeeper or Kyverno for org policy
 - Restrict privileged pods, hostPath, and hostNetwork
 
-### 10.4 Secrets & supply chain
+### 11.4 Secrets & supply chain
 
 - Encrypt secrets at rest (`EncryptionConfiguration` for etcd)
 - Use sealed-secrets / external secrets / cloud KMS
 - Pin image digests; scan images in CI
 - Restrict who can create privileged workloads
 
-### 10.5 Node & OS
+### 11.5 Node & OS
 
 - Keep OS patched; reboot policy for kernel updates
 - Separate OS disk vs container/etcd data where possible
 - Disable unused services; restrict SSH to bastion / break-glass accounts
 - Configure log shipping (kubelet, container runtime, audit logs)
 
-### 10.6 Kubernetes audit logging
+### 11.6 Kubernetes audit logging
 
 Configure API server audit policy and ship logs to a SIEM.
 
 ---
 
-## 11. Useful operations
+## 12. Useful operations
 
 ### Regenerate join command
 
@@ -641,7 +940,7 @@ sudo rm -rf /etc/cni/net.d
 
 ---
 
-## 12. Verification matrix
+## 13. Verification matrix
 
 | Check                         | Command / expectation                          |
 |------------------------------|-------------------------------------------------|
@@ -666,6 +965,7 @@ Cluster       → install CNI
 CP2/CP3       → kubeadm join --control-plane --certificate-key ...
 Workers       → kubeadm join ...
 Then          → metrics, CSI, ingress, backups, hardening
+Admin host    → completion, kube-ps1, krew plugins, aliases, k9s/helm
 ```
 
 ---
@@ -677,3 +977,6 @@ Then          → metrics, CSI, ingress, backups, hardening
 - [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
 - [Certificate management](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-certs/)
 - [Upgrading kubeadm clusters](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/)
+- [kubectl autocomplete](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_completion/)
+- [Krew – kubectl plugin manager](https://krew.sigs.k8s.io/)
+- [kube-ps1](https://github.com/jonmosco/kube-ps1)
