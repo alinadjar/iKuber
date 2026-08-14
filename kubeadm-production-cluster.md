@@ -535,6 +535,8 @@ kubectl delete deployment nginx service nginx
 
 ### 9.2 Metrics Server (for HPA / `kubectl top`)
 
+Full guide (install, kubeadm TLS, HPA samples): [metrics-server-hpa.md](./metrics-server-hpa.md).
+
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 # If needed in lab/TLS-edge environments, patch args for insecure TLS to kubelets carefully.
@@ -544,7 +546,7 @@ kubectl -n kube-system get pods -l k8s-app=metrics-server
 ### 9.3 Core add-ons
 
 - [ ] CSI storage driver for your cloud/on-prem storage
-- [ ] Ingress controller (e.g. Ingress-NGINX or Traefik)
+- [ ] Ingress controller (see [concepts/ingress-zero-to-hero.md](./concepts/ingress-zero-to-hero.md); MetalLB on bare metal via [cni-calico.md](./cni-calico.md) §7)
 - [ ] Cert-manager for TLS certificates
 - [ ] Cluster autoscaler / machine provisioning (if applicable)
 - [ ] Backup for etcd (Velero and/or scheduled `etcdctl snapshot`)
@@ -900,6 +902,7 @@ spec:
 - Separate OS disk vs container/etcd data where possible
 - Disable unused services; restrict SSH to bastion / break-glass accounts
 - Configure log shipping (kubelet, container runtime, audit logs)
+- **Do not expose control-plane `:6443` to the public internet** — use VPN/bastion ([secure-api-access-bastion.md](./concepts/secure-api-access-bastion.md)); expose apps via Ingress only
 
 ### 11.6 Kubernetes audit logging
 
@@ -923,11 +926,15 @@ sudo kubeadm init phase upload-certs --upload-certs
 
 ### Upgrade cluster (high level)
 
-1. Upgrade first control plane: `kubeadm upgrade plan` → `kubeadm upgrade apply`
-2. Upgrade kubelet/kubectl packages on that node; restart kubelet
-3. Drain/uncordon remaining control planes one by one
-4. Drain/upgrade workers one by one
-5. Always follow the [official version skew policy](https://kubernetes.io/docs/setup/release/version-skew-policy/)
+Full procedure and skew rules: [concepts/kubeadm-upgrade-skew-policy.md](./concepts/kubeadm-upgrade-skew-policy.md).
+
+1. Backup etcd + `/etc/kubernetes`; fix deprecated APIs  
+2. Latest **patch** on the current minor, then upgrade **one minor at a time** (no skipping)  
+3. First control plane: install target `kubeadm` → `kubeadm upgrade plan` → `kubeadm upgrade apply` → upgrade `kubelet`/`kubectl` → restart kubelet  
+4. Other control planes: `kubeadm upgrade node` + kubelet packages (one node at a time)  
+5. Upgrade CNI if required ([Calico](./cni-calico.md) / [Cilium](./cni-cilium.md))  
+6. Workers: drain → `kubeadm upgrade node` → kubelet → uncordon  
+7. Follow the [official version skew policy](https://kubernetes.io/releases/version-skew-policy/)
 
 ### Reset a node (destructive)
 
@@ -950,7 +957,7 @@ sudo rm -rf /etc/cni/net.d
 | DNS                          | `kubectl -n kube-system get pods -l k8s-app=kube-dns` |
 | CNI                          | Pod-to-pod connectivity across nodes            |
 | API via LB                   | `kubectl` works through `controlPlaneEndpoint`  |
-| Certificates                 | `kubeadm certs check-expiration`                |
+| Certificates                 | `kubeadm certs check-expiration` ([renewal guide](./concepts/certificate-renewal.md)) |
 | Backup                       | Successful etcd snapshot + restore drill        |
 
 ---
@@ -977,6 +984,7 @@ Admin host    → completion, kube-ps1, krew plugins, aliases, k9s/helm
 - [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
 - [Certificate management](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-certs/)
 - [Upgrading kubeadm clusters](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/)
+- [Version skew policy (detailed local guide)](./concepts/kubeadm-upgrade-skew-policy.md)
 - [kubectl autocomplete](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_completion/)
 - [Krew – kubectl plugin manager](https://krew.sigs.k8s.io/)
 - [kube-ps1](https://github.com/jonmosco/kube-ps1)

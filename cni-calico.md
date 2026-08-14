@@ -2,7 +2,7 @@
 
 Configure and install **Project Calico** (Tigera Operator) as the pod network for a kubeadm cluster.
 
-Companion docs: [kubeadm-production-cluster.md](./kubeadm-production-cluster.md) · [cni-cilium.md](./cni-cilium.md)
+Companion docs: [kubeadm-production-cluster.md](./kubeadm-production-cluster.md) · [cni-cilium.md](./cni-cilium.md) · [concepts/ingress-zero-to-hero.md](./concepts/ingress-zero-to-hero.md)
 
 > Install **one** CNI only. Nodes stay `NotReady` until a CNI is running.
 
@@ -445,6 +445,39 @@ kubectl -n metallb-system logs ds/speaker --tail=100
 kubectl -n metallb-system get ipaddresspools,l2advertisements,bgppeers,bgpadvertisements
 ```
 
+### 7.10 Ingress on Calico clusters
+
+Calico provides **pod networking and NetworkPolicy**, not an Ingress controller. For HTTP(S) edge routing, add a controller after MetalLB (typical bare-metal path). Full walkthrough: **[concepts/ingress-zero-to-hero.md](./concepts/ingress-zero-to-hero.md)**.
+
+```text
+Calico (CNI) → MetalLB (EXTERNAL-IP) → Ingress Controller (nginx/Traefik/…) → Ingress → Services → Pods
+```
+
+**Recommended order**
+
+1. Calico Ready (`kubectl get nodes`)  
+2. MetalLB pool + L2/BGP (§7)  
+3. Install Ingress-NGINX (or other) with `controller.service.type=LoadBalancer`  
+4. cert-manager for TLS  
+5. NetworkPolicies so **only** the ingress controller namespace can reach app pods  
+
+```bash
+# After MetalLB is healthy
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+  -n ingress-nginx --create-namespace \
+  --set controller.replicaCount=2 \
+  --set controller.service.type=LoadBalancer \
+  --wait
+
+kubectl -n ingress-nginx get svc ingress-nginx-controller
+# EXTERNAL-IP should be from your MetalLB pool
+```
+
+**NetworkPolicy tip:** default-deny in app namespaces will block the controller unless you allow it (see ingress guide §6.3). Calico `NetworkPolicy` / `GlobalNetworkPolicy` can also lock down host endpoints for the ingress nodes if you use dedicated ingress pools (taint + toleration).
+
+**Do not** confuse Calico BGP (pod routes) with advertising Ingress hosts — DNS points at the MetalLB VIP owned by the Ingress controller Service.
+
 ---
 
 ## 8. Useful post-install tweaks
@@ -465,12 +498,52 @@ Then re-apply / patch the `Installation` named `default`.
 
 Mirror Calico images and set `spec.registry` (and/or `imagePath` / `imagePrefix`) on the `Installation` resource per [Calico install reference](https://docs.tigera.io/calico/latest/reference/installation/api).
 
-### 8.3 Upgrade (high level)
+### 8.3 Upgrade Calico (with a kubeadm Kubernetes upgrade)
 
-1. Read release notes for your target Calico version  
-2. Upgrade operator manifest for the new version  
-3. Operator reconciles Calico components  
-4. Watch `calico-system` and `tigera-operator` pods / `TigeraStatus`
+Coordinate with the cluster upgrade flow in [concepts/kubeadm-upgrade-skew-policy.md](./concepts/kubeadm-upgrade-skew-policy.md). Confirm the target Calico release supports your **current and target** Kubernetes minors ([Calico requirements](https://docs.tigera.io/calico/latest/getting-started/kubernetes/requirements)).
+
+**When to upgrade Calico**
+
+| Situation | Guidance |
+|-----------|----------|
+| Current Calico already supports the new Kubernetes | Upgrade Kubernetes first (CP → workers), then optionally bump Calico |
+| Current Calico does **not** support the new Kubernetes | Upgrade Calico (or intermediate Calico) **before** or **as soon as** control plane is on the new minor—before finishing workers if nodes go NotReady |
+| Skipping Calico minors | Prefer stepping through supported Calico versions; read release notes for CRD/operator breaking changes |
+
+**Step-by-step (Tigera Operator)**
+
+```bash
+# 0) Baseline
+kubectl get nodes
+kubectl get tigerastatus
+kubectl -n calico-system get pods
+kubectl get installation default -o yaml > installation-backup.yaml
+
+# 1) Pick target (example)
+export CALICO_VERSION=v3.29.2   # must support your K8s version
+
+# 2) Upgrade operator (and CRDs if your release ships them separately)
+# Some releases need:
+# kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/v1_crd_projectcalico_org.yaml
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml
+
+# 3) Wait for operator, then for Calico components to reconcile
+kubectl -n tigera-operator rollout status deploy/tigera-operator --timeout=180s
+kubectl get tigerastatus
+kubectl -n calico-system get pods -o wide
+kubectl -n calico-system wait --for=condition=Ready pod -l k8s-app=calico-node --timeout=300s
+```
+
+**Notes**
+
+- Your `Installation` / `APIServer` CRs normally **persist**; the new operator reconciles them. Re-check `ipPools[].cidr` still matches `podSubnet` after upgrade.
+- For eBPF dataplane or major encapsulation changes, follow Calico’s migration guides—don’t flip dataplane casually mid-incident.
+- After upgrade, re-run a pod-to-pod connectivity check (see §5) and confirm NetworkPolicies still enforce.
+- MetalLB is independent; upgrade MetalLB only if its release notes require it for your Kubernetes bump.
+
+**Rollback (limited)**
+
+Operator upgrades are not always cleanly reversible. Prefer etcd/cluster backup before combined K8s+Calico upgrades. If the operator is unhealthy, restore known-good operator manifest carefully and contact Calico upgrade docs for your version pair.
 
 ---
 
@@ -484,6 +557,7 @@ Mirror Calico images and set `spec.registry` (and/or `imagePath` / `imagePrefix`
 | BGP not establishing | TCP/179; `calicoctl node status`; ToR ASN/peer config |
 | Operator CrashLoop | CRD/version skew; `kubectl -n tigera-operator logs deploy/tigera-operator` |
 | LoadBalancer pending | See [§7 MetalLB](#7-add-metallb-loadbalancer-ips-on-bare-metal) |
+| Ingress ADDRESS empty / 502 | See [§7.10](#710-ingress-on-calico-clusters) and [ingress-zero-to-hero](./concepts/ingress-zero-to-hero.md) |
 
 ```bash
 kubectl -n tigera-operator logs deploy/tigera-operator --tail=100
@@ -504,6 +578,8 @@ kubeadm init with podSubnet=192.168.0.0/16
   → smoke-test pod networking → NetworkPolicies
   → install MetalLB → IPAddressPool + L2Advertisement (or BGP)
   → test Service type=LoadBalancer
+  → install Ingress controller (LoadBalancer) + Ingress/TLS
+    (see concepts/ingress-zero-to-hero.md)
 ```
 
 ---
@@ -518,3 +594,6 @@ kubeadm init with podSubnet=192.168.0.0/16
 - [MetalLB configuration](https://metallb.universe.tf/configuration/)
 - [MetalLB Layer 2](https://metallb.universe.tf/concepts/layer2/)
 - [MetalLB BGP](https://metallb.universe.tf/concepts/bgp/)
+- [Ingress from zero to hero](./concepts/ingress-zero-to-hero.md)
+- [kubeadm upgrade & skew policy](./concepts/kubeadm-upgrade-skew-policy.md)
+- [Calico upgrade docs](https://docs.tigera.io/calico/latest/operations/upgrading/)

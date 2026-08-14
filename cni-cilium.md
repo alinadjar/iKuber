@@ -2,7 +2,7 @@
 
 Configure and install **Cilium** as the pod network (and optionally kube-proxy replacement) for a kubeadm cluster.
 
-Companion docs: [kubeadm-production-cluster.md](./kubeadm-production-cluster.md) · [cni-calico.md](./cni-calico.md)
+Companion docs: [kubeadm-production-cluster.md](./kubeadm-production-cluster.md) · [cni-calico.md](./cni-calico.md) · [concepts/ingress-zero-to-hero.md](./concepts/ingress-zero-to-hero.md)
 
 > Install **one** CNI only. Nodes stay `NotReady` until a CNI is running.
 
@@ -290,22 +290,133 @@ Always set `k8sServiceHost` to the **load balancer / `controlPlaneEndpoint` host
 - **Tunnel (VXLAN/Geneve):** fewer underlay requirements; slight overhead  
 - **Native routing:** better performance; configure node routes / BGP (e.g. Cilium BGP control plane) so pod CIDRs are reachable
 
-### 8.3 kubeadm upgrades with kube-proxy skipped
+### 8.3 Ingress and Gateway API on Cilium
+
+Cilium can either **coexist** with a classic Ingress controller (nginx + MetalLB) or provide **Cilium Ingress / Gateway API** on the eBPF datapath. Full HTTP edge concepts: **[concepts/ingress-zero-to-hero.md](./concepts/ingress-zero-to-hero.md)**.
+
+| Approach | When to use |
+|----------|-------------|
+| **Ingress-NGINX (or Traefik) + MetalLB** | Familiar annotations; same as Calico setups; works with kube-proxy or kube-proxy replacement |
+| **Cilium Gateway API / Ingress** | Want one dataplane (Cilium) for CNI + L7 edge; fewer moving parts |
+
+**Option A — classic controller (same as Calico path)**
+
+```bash
+# MetalLB first if bare metal (see cni-calico.md §7 — MetalLB is CNI-agnostic)
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+  -n ingress-nginx --create-namespace \
+  --set controller.replicaCount=2 \
+  --set controller.service.type=LoadBalancer \
+  --wait
+```
+
+**Option B — enable Cilium Gateway API / Ingress**
+
+Exact Helm flags evolve; check your Cilium version docs. Typical shape:
+
+```bash
+# Example — verify flag names for your Cilium version
+cilium upgrade --version ${CILIUM_VERSION} \
+  --set gatewayAPI.enabled=true \
+  --set ingressController.enabled=true \
+  --set ingressController.loadbalancerMode=dedicated
+# Or via helm upgrade cilium cilium/cilium --reuse-values \
+#   --set gatewayAPI.enabled=true --set ingressController.enabled=true ...
+
+# Gateway API CRDs (if not installed by Cilium):
+# kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+
+cilium status --wait
+kubectl get gatewayclass,ingressclass
+```
+
+**Rules of thumb**
+
+- Do **not** run two controllers as the default IngressClass for the same objects.  
+- With **kube-proxy replacement**, LoadBalancer Services for Ingress still need MetalLB (or cloud LB) unless you use Cilium LB features configured for your environment.  
+- NetworkPolicy / CiliumNetworkPolicy: allow ingress controller (or Cilium envoy) identity to reach app pods when default-deny is on.  
+- Hubble can visualize north-south traffic once Ingress is in place.
+
+### 8.4 kubeadm upgrades with kube-proxy skipped
 
 Keep kube-proxy disabled across upgrades (`skipPhases` / delete ConfigMap) so kubeadm does not bring kube-proxy back.
 
-### 8.4 Upgrade Cilium
+After each `kubeadm upgrade apply` / `upgrade node`, verify kube-proxy was **not** recreated:
 
 ```bash
-# CLI
-cilium upgrade --version <new-version>
+kubectl -n kube-system get ds kube-proxy
+# Should be NotFound when using full kube-proxy replacement
 
-# Helm
-helm upgrade cilium cilium/cilium --version <new-version> \
-  --namespace kube-system --reuse-values
+# If it reappeared:
+kubectl -n kube-system delete ds kube-proxy
+kubectl -n kube-system delete cm kube-proxy
 ```
 
-Follow [Cilium upgrade notes](https://docs.cilium.io/en/stable/operations/upgrade/) for your minor version jump.
+See [concepts/kubeadm-upgrade-skew-policy.md](./concepts/kubeadm-upgrade-skew-policy.md) for the full Kubernetes upgrade order.
+
+### 8.5 Upgrade Cilium (with a kubeadm Kubernetes upgrade)
+
+Confirm the target Cilium release supports your **current and target** Kubernetes versions ([Cilium upgrade / compatibility](https://docs.cilium.io/en/stable/operations/upgrade/)).
+
+**When to upgrade Cilium**
+
+| Situation | Guidance |
+|-----------|----------|
+| Current Cilium supports new Kubernetes | Upgrade Kubernetes (CP → workers), then bump Cilium if desired |
+| Current Cilium **incompatible** with new Kubernetes | Upgrade Cilium to a compatible version **before** or immediately after CP upgrade |
+| Skipping Cilium minors | Upgrade one Cilium minor at a time when release notes require it; never skip required intermediate versions |
+
+**Pre-checks**
+
+```bash
+cilium status
+kubectl -n kube-system get pods -l k8s-app=cilium
+cilium version
+# Optional: run before/after
+# cilium connectivity test
+```
+
+**Upgrade with Cilium CLI**
+
+```bash
+export CILIUM_VERSION=1.16.6   # example — pick a K8s-compatible release
+
+cilium upgrade --version ${CILIUM_VERSION}
+cilium status --wait
+```
+
+**Upgrade with Helm**
+
+```bash
+helm repo update
+helm upgrade cilium cilium/cilium --version ${CILIUM_VERSION} \
+  --namespace kube-system \
+  --reuse-values
+
+# If you must set values explicitly (kube-proxy replacement), keep them:
+#   --set kubeProxyReplacement=true \
+#   --set k8sServiceHost=k8s-api.example.com \
+#   --set k8sServicePort=6443
+
+kubectl -n kube-system rollout status ds/cilium --timeout=300s
+cilium status --wait
+```
+
+**Post-upgrade checks**
+
+```bash
+cilium status --verbose
+kubectl -n kube-system exec ds/cilium -c cilium-agent -- \
+  cilium status 2>/dev/null | grep -i KubeProxyReplacement || true
+cilium connectivity test
+```
+
+**Notes**
+
+- `--reuse-values` preserves Hubble, IPAM, and routing settings—review `helm get values cilium -n kube-system` before major jumps.
+- After Kubernetes upgrades, re-validate `k8sServiceHost` still points at the **API load balancer**, not a single CP IP.
+- Kernel / BPF requirements can rise with newer Cilium; check node kernels before upgrading.
+- Coordinate with [kubeadm upgrade & skew](./concepts/kubeadm-upgrade-skew-policy.md): finish control plane, ensure CNI healthy, then roll workers.
 
 ---
 
@@ -318,6 +429,7 @@ Follow [Cilium upgrade notes](https://docs.cilium.io/en/stable/operations/upgrad
 | Cross-node fail | Tunnel UDP blocked, or native routing missing routes |
 | BPF / kernel errors | Kernel too old; `cilium status` features; dmesg |
 | Hubble UI empty | Relay/UI not enabled; `cilium hubble enable --ui` |
+| Ingress / Gateway not working | See [§8.3](#83-ingress-and-gateway-api-on-cilium); IngressClass/GatewayClass; MetalLB EXTERNAL-IP |
 
 ```bash
 cilium status --verbose
@@ -340,6 +452,8 @@ Mode B (kube-proxy replacement):
     → cilium install --set kubeProxyReplacement=true \
          --set k8sServiceHost=<LB> --set k8sServicePort=6443
     → cilium status --wait → hubble / policies
+    → Ingress: nginx+MetalLB OR Cilium Gateway/Ingress
+      (see concepts/ingress-zero-to-hero.md)
 ```
 
 ---
@@ -351,3 +465,8 @@ Mode B (kube-proxy replacement):
 - [Cilium CLI getting started](https://docs.cilium.io/en/stable/gettingstarted/cilium-cli/)
 - [Helm values reference](https://docs.cilium.io/en/stable/helm-reference/)
 - [Network policy](https://docs.cilium.io/en/stable/security/policy/)
+- [kubeadm upgrade & skew policy](./concepts/kubeadm-upgrade-skew-policy.md)
+- [Cilium upgrade guide](https://docs.cilium.io/en/stable/operations/upgrade/)
+- [Ingress from zero to hero](./concepts/ingress-zero-to-hero.md)
+- [Cilium Gateway API](https://docs.cilium.io/en/stable/network/servicemesh/gateway-api/)
+- [Cilium Ingress](https://docs.cilium.io/en/stable/network/servicemesh/ingress/)
