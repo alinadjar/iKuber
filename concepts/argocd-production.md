@@ -2,8 +2,11 @@
 
 How to install and operate **Argo CD** for GitOps in production: HA, security, repo design, sync policy, multi-cluster, and day-2 ops.
 
+Hands-on learning path (install → first app → App of Apps): [argocd-zero-to-hero.md](./argocd-zero-to-hero.md)
+
 Related:
 
+- [argocd-zero-to-hero.md](./argocd-zero-to-hero.md)
 - [helm-zero-to-hero.md](./helm-zero-to-hero.md)
 - [developer-access-rbac.md](./developer-access-rbac.md)
 - [oidc-sso-setup.md](./oidc-sso-setup.md)
